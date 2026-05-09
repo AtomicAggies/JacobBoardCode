@@ -7,6 +7,7 @@
 
 // ================= CONFIG =================
 #define PPS_PIN   8
+#define LED_PIN   7
 #define CPU_HZ    600000000ULL
 
 #define TX_CYCLE_MS 1400
@@ -534,6 +535,7 @@ void processScheduledTransmission() {
   interrupts();
 
   if (sendLoRa(reinterpret_cast<uint8_t*>(&tx_copy), sizeof(tx_copy))) {
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     noInterrupts();
     packet_ready = false;
     txWindowSendArmed = false;
@@ -547,6 +549,9 @@ void setup() {
   delay(1000);
 
   enableCycleCounter();
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);

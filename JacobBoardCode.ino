@@ -205,7 +205,6 @@ void markTelemetryPacketReady() {
 
 void processI2CFrame(const I2CFrame &frame) {
   if (frame.length < I2C_FRAME_HEADER_SIZE) {
-    invalidPacketCount++;
     Serial.print("Discarded invalid I2C frame shorter than header: ");
     Serial.println(frame.length);
     discardPartialPacket("short I2C frame");
@@ -241,7 +240,6 @@ void processI2CFrame(const I2CFrame &frame) {
     receivingPacket = true;
     lastPacketFrameMillis = millis();
   } else if (!receivingPacket) {
-    invalidPacketCount++;
     Serial.println("Discarded continuation I2C frame with no active telemetry packet");
     return;
   }
@@ -374,10 +372,15 @@ void handleTransmission() {
 
         noInterrupts();
         memcpy(tx_copy, (const void*)tx_buffer, TELEMETRY_PACKET_SIZE);
-        packet_ready = false;
         interrupts();
 
         already_sent = sendLoRa(tx_copy, TELEMETRY_PACKET_SIZE);
+
+        if (already_sent) {
+          noInterrupts();
+          packet_ready = false;
+          interrupts();
+        }
       }
     }
 

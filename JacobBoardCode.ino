@@ -20,44 +20,54 @@
 #define epoch 1400 //epoch in ms
 
 // Singleton instance of the radio driver
-RH_RF95 rf95(RFM95_CS, 2);
+RH_RF95 rf95(RFM95_CS, RFM95_INT);
 
 // Adjustable send window (DEFAULT = 40 ms)
 uint32_t TX_READY_WINDOW_MS = 40;
 
-// SPI
-#define LORA_CS 10
+// I2C framing. This matches SpencerBoardCode's telemetry sender and
+// AbrahamBoardCode's receiver: Spencer sends a 98-byte telemetry packet as
+// multiple 32-byte I2C frames addressed to the broadcast/general-call address.
+const uint8_t TELEMETRY_PACKET_SIZE = 98;
+const uint8_t I2C_RECEIVE_ADDRESS = 0x00;
+const uint8_t I2C_FRAME_MAX_SIZE = 32;
+const uint8_t I2C_FRAME_HEADER_SIZE = 2;
+const uint8_t I2C_FRAME_PAYLOAD_SIZE = I2C_FRAME_MAX_SIZE - I2C_FRAME_HEADER_SIZE;
 
-// I2C
-#define I2C_ADDRESS 0x08
+// I2C frame header byte 0:
+// bit 0: frame is intended for the SD-card receiver
+// bit 1: frame is intended for the radio/antenna receiver
+// bit 7: frame starts a new telemetry packet; clear means continuation
+// I2C frame header byte 1 is an 8-bit checksum of the payload bytes that
+// follow the header.
+const uint8_t I2C_FRAME_DESTINATION_RADIO = 1 << 1;
+const uint8_t I2C_FRAME_START = 1 << 7;
+const uint8_t FRAME_QUEUE_SIZE = 8;
+const unsigned long PACKET_RECEIVE_TIMEOUT_MS = 1000;
 
-// Ham radio callsign and LoRa frequency
-#define CALLSIGN        "KI5VVL"
-#define LORA_FREQUENCY  434
-
-// =============== PACKET CONFIG ===============
-#define CALLSIGN_SIZE 6
-#define ALTITUDE_SIZE 24
-#define MAG_SIZE 16
-#define ACCEL_SIZE 96
-#define GPS_SIZE 92
-#define TEMP_SIZE 16
-#define STAGE_ID 1
-
-const uint8_t PACKET_SIZE = CALLSIGN_SIZE + 1 + ALTITUDE_SIZE + MAG_SIZE + ACCEL_SIZE + GPS_SIZE + TEMP_SIZE;
-
-struct TelemetryPacket {
-  uint8_t callsign[CALLSIGN_SIZE];
-  uint8_t stage_id;
-  uint8_t altitude[ALTITUDE_SIZE];
-  uint8_t magnetometer[MAG_SIZE];
-  uint8_t accelerometer[ACCEL_SIZE];
-  uint8_t gps[GPS_SIZE];
-  uint8_t temperature[TEMP_SIZE];
+struct I2CFrame {
+  uint8_t length;
+  uint8_t bytes[I2C_FRAME_MAX_SIZE];
 };
 
-volatile TelemetryPacket rx_buffer;
+volatile uint8_t frameQueueHead = 0;
+volatile uint8_t frameQueueTail = 0;
+volatile uint16_t droppedFrameCount = 0;
+I2CFrame frameQueue[FRAME_QUEUE_SIZE];
+
+uint8_t telemetryBuffer[TELEMETRY_PACKET_SIZE];
+uint8_t telemetryBufferLength = 0;
+bool receivingPacket = false;
+unsigned long lastPacketFrameMillis = 0;
+
+volatile uint8_t tx_buffer[TELEMETRY_PACKET_SIZE];
 volatile bool packet_ready = false;
+
+uint32_t validPacketCount = 0;
+uint32_t invalidPacketCount = 0;
+uint32_t ignoredFrameCount = 0;
+uint32_t checksumFailureCount = 0;
+bool loraReady = false;
 
 // ========== 64-bit cycle counter ==========
 volatile uint32_t last_cycle_low = 0;
@@ -157,48 +167,194 @@ uint32_t getCycleTimeMs() {
   return ((uint32_t)ms) % TX_CYCLE_MS;
 }
 
-// ========== RECEIVE I2C PACKET ==========
-void receiveI2C(int bytes) {
-  static uint8_t temp[PACKET_SIZE];
-  static uint16_t idx = 0;
+// ========== I2C PACKET ASSEMBLY ==========
+uint8_t checksumI2CPayload(const uint8_t *payload, uint8_t payloadSize) {
+  uint8_t checksum = 0;
+  for (uint8_t index = 0; index < payloadSize; index++) {
+    checksum += payload[index];
+  }
+  return checksum;
+}
 
-  while (Wire.available()) {
-    uint8_t byte = Wire.read();
-    Serial.print((char)byte);
+void discardPartialPacket(const char *reason) {
+  if (receivingPacket || telemetryBufferLength > 0) {
+    invalidPacketCount++;
+    Serial.print("Discarded partial telemetry packet (");
+    Serial.print(telemetryBufferLength);
+    Serial.print("/");
+    Serial.print(TELEMETRY_PACKET_SIZE);
+    Serial.print(" bytes): ");
+    Serial.println(reason);
+  }
 
-    temp[idx++] = byte;
+  telemetryBufferLength = 0;
+  receivingPacket = false;
+  lastPacketFrameMillis = 0;
+}
 
-    if (idx >= PACKET_SIZE - CALLSIGN_SIZE - 1) {
-      memcpy((void*)&rx_buffer, CALLSIGN, CALLSIGN_SIZE);
-      memset((void*)&rx_buffer+CALLSIGN_SIZE, STAGE_ID, 1);
-      memcpy((void*)&rx_buffer+CALLSIGN_SIZE+1, temp, PACKET_SIZE);
-      packet_ready = true;
-      idx = 0;
+void markTelemetryPacketReady() {
+  noInterrupts();
+  memcpy((void*)tx_buffer, telemetryBuffer, TELEMETRY_PACKET_SIZE);
+  packet_ready = true;
+  interrupts();
 
-      Serial.println("Packet received");
-      TelemetryPacket tx_copy;
+  validPacketCount++;
+  Serial.print("Telemetry packet ready for LoRa TX: ");
+  Serial.println(validPacketCount);
+}
 
-      noInterrupts();
-      memcpy(&tx_copy, (const void*)&rx_buffer, sizeof(rx_buffer));
-      interrupts();
+void processI2CFrame(const I2CFrame &frame) {
+  if (frame.length < I2C_FRAME_HEADER_SIZE) {
+    invalidPacketCount++;
+    Serial.print("Discarded invalid I2C frame shorter than header: ");
+    Serial.println(frame.length);
+    discardPartialPacket("short I2C frame");
+    return;
+  }
 
-      rf95.send((uint8_t*)&tx_copy, sizeof(tx_copy));
-      rf95.waitPacketSent();
-    }
+  uint8_t frameFlags = frame.bytes[0];
+  uint8_t receivedChecksum = frame.bytes[1];
+  uint8_t payloadSize = frame.length - I2C_FRAME_HEADER_SIZE;
+  const uint8_t *payload = frame.bytes + I2C_FRAME_HEADER_SIZE;
+  bool isStartFrame = (frameFlags & I2C_FRAME_START) != 0;
+
+  if ((frameFlags & I2C_FRAME_DESTINATION_RADIO) == 0) {
+    ignoredFrameCount++;
+    return;
+  }
+
+  uint8_t calculatedChecksum = checksumI2CPayload(payload, payloadSize);
+  if (calculatedChecksum != receivedChecksum) {
+    checksumFailureCount++;
+    Serial.print("Checksum failure on I2C frame (received 0x");
+    Serial.print(receivedChecksum, HEX);
+    Serial.print(", calculated 0x");
+    Serial.print(calculatedChecksum, HEX);
+    Serial.println(")");
+    discardPartialPacket("I2C frame checksum failure");
+    return;
+  }
+
+  if (isStartFrame) {
+    discardPartialPacket("new telemetry packet started before 98 bytes were received");
+    telemetryBufferLength = 0;
+    receivingPacket = true;
+    lastPacketFrameMillis = millis();
+  } else if (!receivingPacket) {
+    invalidPacketCount++;
+    Serial.println("Discarded continuation I2C frame with no active telemetry packet");
+    return;
+  }
+
+  if (payloadSize == 0) {
+    discardPartialPacket("empty I2C frame payload");
+    return;
+  }
+
+  if (telemetryBufferLength + payloadSize > TELEMETRY_PACKET_SIZE) {
+    discardPartialPacket("I2C frame would overflow 98-byte telemetry buffer");
+    return;
+  }
+
+  memcpy(telemetryBuffer + telemetryBufferLength, payload, payloadSize);
+  telemetryBufferLength += payloadSize;
+  lastPacketFrameMillis = millis();
+
+  if (telemetryBufferLength == TELEMETRY_PACKET_SIZE) {
+    markTelemetryPacketReady();
+    telemetryBufferLength = 0;
+    receivingPacket = false;
+    lastPacketFrameMillis = 0;
   }
 }
 
-// ========== SPI SEND ==========
-void sendSPI(uint8_t* data, uint16_t len) {
-  digitalWrite(LORA_CS, LOW);
-
-  for (uint16_t i = 0; i < len; i++) {
-    SPI.transfer(data[i]);
+bool popQueuedFrame(I2CFrame &frame) {
+  noInterrupts();
+  if (frameQueueHead == frameQueueTail) {
+    interrupts();
+    return false;
   }
 
-  digitalWrite(LORA_CS, HIGH);
+  frame = frameQueue[frameQueueTail];
+  frameQueueTail = (frameQueueTail + 1) % FRAME_QUEUE_SIZE;
+  interrupts();
+  return true;
+}
 
-  Serial.println("Packet sent via SPI");
+// ========== RECEIVE I2C FRAME ISR ==========
+void receiveI2C(int count) {
+  if (count > I2C_FRAME_MAX_SIZE) {
+    while (Wire.available()) {
+      Wire.read();
+    }
+    droppedFrameCount++;
+    return;
+  }
+
+  uint8_t nextHead = (frameQueueHead + 1) % FRAME_QUEUE_SIZE;
+  if (nextHead == frameQueueTail) {
+    while (Wire.available()) {
+      Wire.read();
+    }
+    droppedFrameCount++;
+    return;
+  }
+
+  I2CFrame &frame = frameQueue[frameQueueHead];
+  frame.length = 0;
+  while (Wire.available()) {
+    uint8_t byteValue = Wire.read();
+    if (frame.length < I2C_FRAME_MAX_SIZE) {
+      frame.bytes[frame.length++] = byteValue;
+    } else {
+      droppedFrameCount++;
+    }
+  }
+  frameQueueHead = nextHead;
+}
+
+void processQueuedI2CFrames() {
+  static uint16_t lastDroppedFrameCount = 0;
+
+  noInterrupts();
+  uint16_t currentDroppedFrameCount = droppedFrameCount;
+  interrupts();
+
+  if (currentDroppedFrameCount != lastDroppedFrameCount) {
+    uint16_t droppedSinceLastLog = currentDroppedFrameCount - lastDroppedFrameCount;
+    lastDroppedFrameCount = currentDroppedFrameCount;
+    Serial.print("WARNING: I2C frame queue overflow dropped ");
+    Serial.print(droppedSinceLastLog);
+    Serial.println(" frame(s)");
+    discardPartialPacket("I2C frame queue overflow");
+  }
+
+  I2CFrame frame;
+  while (popQueuedFrame(frame)) {
+    processI2CFrame(frame);
+  }
+
+  if (receivingPacket && lastPacketFrameMillis != 0 &&
+      millis() - lastPacketFrameMillis > PACKET_RECEIVE_TIMEOUT_MS) {
+    discardPartialPacket("timed out before 98 bytes were received");
+  }
+}
+
+// ========== LORA SEND ==========
+bool sendLoRa(uint8_t* data, uint8_t len) {
+  if (!loraReady) {
+    Serial.println("LoRa TX skipped because radio is not initialized");
+    return false;
+  }
+
+  if (!rf95.send(data, len)) {
+    Serial.println("LoRa TX failed to start");
+    return false;
+  }
+
+  rf95.waitPacketSent();
+  Serial.println("Packet sent via LoRa");
+  return true;
 }
 
 // ========== TRANSMISSION LOGIC ==========
@@ -214,9 +370,14 @@ void handleTransmission() {
         t <= (SLOT_SUSTAINER_START + TX_READY_WINDOW_MS)) {
 
       if (packet_ready) {
-        sendSPI((uint8_t*)&rx_buffer, PACKET_SIZE);
+        uint8_t tx_copy[TELEMETRY_PACKET_SIZE];
+
+        noInterrupts();
+        memcpy(tx_copy, (const void*)tx_buffer, TELEMETRY_PACKET_SIZE);
         packet_ready = false;
-        already_sent = true;
+        interrupts();
+
+        already_sent = sendLoRa(tx_copy, TELEMETRY_PACKET_SIZE);
       }
     }
 
@@ -235,12 +396,27 @@ void setup() {
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
 
-  pinMode(LORA_CS, OUTPUT);
-  digitalWrite(LORA_CS, HIGH);
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+  digitalWrite(RFM95_RST, LOW);
+  delay(10);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
 
   SPI.begin();
 
-  Wire.begin(I2C_ADDRESS);
+  if (!rf95.init()) {
+    Serial.println("LoRa radio init failed");
+  } else if (!rf95.setFrequency(RF95_FREQ)) {
+    Serial.println("LoRa frequency set failed");
+  } else {
+    rf95.setTxPower(23, false);
+    loraReady = true;
+    Serial.println("LoRa radio initialized");
+  }
+
+  Wire.begin(I2C_RECEIVE_ADDRESS);
   Wire.onReceive(receiveI2C);
 
   Serial.println("System Initialized");
@@ -249,7 +425,7 @@ void setup() {
 // ========== LOOP ==========
 void loop() {
   getCycles64();     // maintain counter
-  // receivePacket();   // fill buffer
+  processQueuedI2CFrames();
 
   if (pps_flag) {
     noInterrupts();
@@ -272,6 +448,16 @@ void loop() {
     Serial.print(" | Cycle ms: ");
     Serial.print(getCycleTimeMs());
     Serial.print(" | Window(ms): ");
-    Serial.println(TX_READY_WINDOW_MS);
+    Serial.print(TX_READY_WINDOW_MS);
+    Serial.print(" | Ready: ");
+    Serial.print(packet_ready ? "yes" : "no");
+    Serial.print(" | Valid: ");
+    Serial.print(validPacketCount);
+    Serial.print(" | Invalid: ");
+    Serial.print(invalidPacketCount);
+    Serial.print(" | Ignored: ");
+    Serial.print(ignoredFrameCount);
+    Serial.print(" | Checksum failures: ");
+    Serial.println(checksumFailureCount);
   }
 }

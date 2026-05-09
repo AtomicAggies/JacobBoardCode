@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <IntervalTimer.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <RH_RF95.h>
@@ -79,6 +80,10 @@ uint32_t invalidPacketCount = 0;
 uint32_t ignoredFrameCount = 0;
 uint32_t checksumFailureCount = 0;
 bool loraReady = false;
+IntervalTimer txWindowOpenTimer;
+IntervalTimer txWindowCloseTimer;
+volatile bool txWindowOpen = false;
+volatile bool txWindowSendArmed = false;
 
 // ========== 64-bit cycle counter ==========
 volatile uint32_t last_cycle_low = 0;
@@ -125,6 +130,18 @@ void pps_isr() {
   pps_flag = true;
 }
 
+void onTxWindowOpen() {
+  txWindowOpenTimer.end();
+  txWindowOpen = true;
+  txWindowSendArmed = true;
+}
+
+void onTxWindowClose() {
+  txWindowCloseTimer.end();
+  txWindowOpen = false;
+  txWindowSendArmed = false;
+}
+
 // ========== HANDLE PPS ==========
 void handlePPS(uint64_t now) {
   cycle_start_cycles = now;  // Anchor TX cycle to PPS
@@ -146,6 +163,14 @@ void handlePPS(uint64_t now) {
 
   last_pps_cycles = now;
   utc_seconds++;
+
+  txWindowOpen = false;
+  txWindowSendArmed = false;
+  txWindowOpenTimer.end();
+  txWindowCloseTimer.end();
+  txWindowOpenTimer.begin(onTxWindowOpen, SLOT_SUSTAINER_START * 1000);
+  txWindowCloseTimer.begin(onTxWindowClose,
+                           (SLOT_SUSTAINER_START + TX_READY_WINDOW_MS) * 1000);
 }
 
 // ========== TIME SINCE PPS ==========
@@ -381,35 +406,22 @@ bool sendLoRa(uint8_t* data, uint8_t len) {
 }
 
 // ========== TRANSMISSION LOGIC ==========
-bool already_sent = false;
+void processScheduledTransmission() {
+  if (!txWindowOpen || !txWindowSendArmed || !packet_ready) {
+    return;
+  }
 
-void handleTransmission() {
-  uint32_t t = getCycleTimeMs();
+  LoRaTransmitPacket tx_copy;
 
-  if (t >= SLOT_SUSTAINER_START &&
-      t < (SLOT_SUSTAINER_START + SLOT_DURATION)) {
+  noInterrupts();
+  memcpy(&tx_copy, (const void*)&lora_tx_buffer, sizeof(tx_copy));
+  interrupts();
 
-    if (!already_sent &&
-        t <= (SLOT_SUSTAINER_START + TX_READY_WINDOW_MS)) {
-
-      if (packet_ready) {
-        LoRaTransmitPacket tx_copy;
-
-        noInterrupts();
-        memcpy(&tx_copy, (const void*)&lora_tx_buffer, sizeof(tx_copy));
-        interrupts();
-
-        if (sendLoRa(reinterpret_cast<uint8_t*>(&tx_copy), sizeof(tx_copy))) {
-          noInterrupts();
-          packet_ready = false;
-          interrupts();
-          already_sent = true;
-        }
-      }
-    }
-
-  } else {
-    already_sent = false;
+  if (sendLoRa(reinterpret_cast<uint8_t*>(&tx_copy), sizeof(tx_copy))) {
+    noInterrupts();
+    packet_ready = false;
+    txWindowSendArmed = false;
+    interrupts();
   }
 }
 
@@ -464,7 +476,7 @@ void loop() {
     handlePPS(now);
   }
 
-  handleTransmission();
+  processScheduledTransmission();
 
   // Debug timing output (optional)
   // static uint32_t lastPrint = 0;

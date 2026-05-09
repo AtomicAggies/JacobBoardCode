@@ -374,12 +374,11 @@ void handleTransmission() {
         memcpy(tx_copy, (const void*)tx_buffer, TELEMETRY_PACKET_SIZE);
         interrupts();
 
-        already_sent = sendLoRa(tx_copy, TELEMETRY_PACKET_SIZE);
-
-        if (already_sent) {
+        if (sendLoRa(tx_copy, TELEMETRY_PACKET_SIZE)) {
           noInterrupts();
           packet_ready = false;
           interrupts();
+          already_sent = true;
         }
       }
     }

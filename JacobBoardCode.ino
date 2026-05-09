@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <RH_RF95.h>
+#include <stddef.h>
 
 // ================= CONFIG =================
 #define PPS_PIN   8
@@ -51,9 +52,8 @@ uint32_t SLOT_START =
   SLOT_TYPE == 2 ? SLOT_PAYLOAD_START : 0;
 
 // I2C framing. This matches SpencerBoardCode's telemetry sender and
-// AbrahamBoardCode's receiver: Spencer sends a 98-byte telemetry packet as
+// AbrahamBoardCode's receiver: Spencer sends one packed TelemetryData as
 // multiple 32-byte I2C frames addressed to this board's I2C slave address.
-const uint8_t TELEMETRY_PACKET_SIZE = 98;
 const uint8_t LORA_CALLSIGN_SIZE = 6;
 const uint8_t I2C_RECEIVE_ADDRESS = 0x08;
 const uint8_t I2C_FRAME_MAX_SIZE = 32;
@@ -70,19 +70,82 @@ const uint8_t I2C_FRAME_DESTINATION_RADIO = 1 << 1;
 const uint8_t I2C_FRAME_START = 1 << 7;
 const uint8_t FRAME_QUEUE_SIZE = 8;
 const unsigned long PACKET_RECEIVE_TIMEOUT_MS = 1000;
-const uint8_t TELEMETRY_OFFSET_GPS_UNIX_EPOCH = 27;
 
 struct I2CFrame {
   uint8_t length;
   uint8_t bytes[I2C_FRAME_MAX_SIZE];
 };
 
-struct __attribute__((packed)) LoRaTransmitPacket {
-  uint8_t callsign[LORA_CALLSIGN_SIZE];
-  uint8_t telemetry[TELEMETRY_PACKET_SIZE];
+// Matches SpencerBoardCode.ino (sensor TX). I2C carries the full TelemetryData;
+// LoRa sends only GPS, BMP, magnetometer, and inertial (no counter, validity, or
+// lastI2C* bookkeeping).
+struct __attribute__((packed)) GPSData {
+  int32_t latitude;
+  int32_t longitude;
+  int32_t altitude;
+  int32_t nedNorthVel;
+  int32_t nedDownVel;
+  int32_t nedEastVel;
+  uint32_t unixEpoch;
 };
 
-static_assert(sizeof(LoRaTransmitPacket) == LORA_CALLSIGN_SIZE + TELEMETRY_PACKET_SIZE,
+struct __attribute__((packed)) BMPData {
+  float temperature;
+  float pressure;
+};
+
+struct __attribute__((packed)) MagnetometerData {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+};
+
+struct __attribute__((packed)) InertialData {
+  float temperature;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+  float accelX;
+  float accelY;
+  float accelZ;
+};
+
+struct __attribute__((packed)) TelemetryData {
+  uint16_t packetCounter;
+  uint8_t validity;
+  GPSData gps;
+  BMPData bmp;
+  MagnetometerData magnetometer;
+  InertialData inertial;
+  uint8_t lastI2CBytesWritten;
+  uint8_t lastI2CStatus;
+};
+
+static_assert(sizeof(TelemetryData) == 75,
+              "TelemetryData must be 75 bytes; update I2C/LoRa peers if layout changes");
+const uint8_t TELEMETRY_PACKET_SIZE = sizeof(TelemetryData);
+
+// Radio payload: four sensor blocks only (matches TelemetryData from gps onward).
+struct __attribute__((packed)) LoRaTelemetryPayload {
+  GPSData gps;
+  BMPData bmp;
+  MagnetometerData magnetometer;
+  InertialData inertial;
+};
+
+static_assert(sizeof(LoRaTelemetryPayload) ==
+                  offsetof(TelemetryData, lastI2CBytesWritten) -
+                      offsetof(TelemetryData, gps),
+              "LoRaTelemetryPayload must match TelemetryData gps..inclusive");
+
+struct __attribute__((packed)) LoRaTransmitPacket {
+  uint8_t callsign[LORA_CALLSIGN_SIZE];
+  uint8_t stage_id[1];
+  LoRaTelemetryPayload telemetry;
+};
+
+static_assert(sizeof(LoRaTransmitPacket) ==
+                  LORA_CALLSIGN_SIZE + 1 + sizeof(LoRaTelemetryPayload),
               "LoRaTransmitPacket size mismatch");
 
 volatile uint8_t frameQueueHead = 0;
@@ -90,10 +153,14 @@ volatile uint8_t frameQueueTail = 0;
 volatile uint16_t droppedFrameCount = 0;
 I2CFrame frameQueue[FRAME_QUEUE_SIZE];
 
-uint8_t telemetryBuffer[TELEMETRY_PACKET_SIZE];
-uint8_t telemetryBufferLength = 0;
+TelemetryData i2cTelemetryBuffer;
+uint8_t i2cTelemetryBytesReceived = 0;
 bool receivingPacket = false;
 unsigned long lastPacketFrameMillis = 0;
+
+uint8_t *i2cTelemetryBytes() {
+  return reinterpret_cast<uint8_t *>(&i2cTelemetryBuffer);
+}
 
 volatile LoRaTransmitPacket lora_tx_buffer;
 volatile bool packet_ready = false;
@@ -165,11 +232,6 @@ void onTxWindowClose() {
   txWindowCloseTimer.end();
   txWindowOpen = false;
   txWindowSendArmed = false;
-}
-
-uint32_t readLeUint32(const uint8_t *bytes) {
-  return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-         ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
 }
 
 // ========== HANDLE PPS ==========
@@ -265,28 +327,28 @@ uint8_t checksumI2CPayload(const uint8_t *payload, uint8_t payloadSize) {
 }
 
 void discardPartialPacket(const char *reason) {
-  if (receivingPacket || telemetryBufferLength > 0) {
+  if (receivingPacket || i2cTelemetryBytesReceived > 0) {
     invalidPacketCount++;
     Serial.print("Discarded partial telemetry packet (");
-    Serial.print(telemetryBufferLength);
+    Serial.print(i2cTelemetryBytesReceived);
     Serial.print("/");
     Serial.print(TELEMETRY_PACKET_SIZE);
     Serial.print(" bytes): ");
     Serial.println(reason);
   }
 
-  telemetryBufferLength = 0;
+  i2cTelemetryBytesReceived = 0;
   receivingPacket = false;
   lastPacketFrameMillis = 0;
 }
 
 void markTelemetryPacketReady() {
   noInterrupts();
-  memcpy((void*)lora_tx_buffer.telemetry, telemetryBuffer, TELEMETRY_PACKET_SIZE);
+  memcpy((void *)&lora_tx_buffer.telemetry, &i2cTelemetryBuffer.gps,
+         sizeof(LoRaTelemetryPayload));
   packet_ready = true;
   interrupts();
-  latestTelemetryUnixEpochSeconds =
-      readLeUint32(telemetryBuffer + TELEMETRY_OFFSET_GPS_UNIX_EPOCH);
+  latestTelemetryUnixEpochSeconds = i2cTelemetryBuffer.gps.unixEpoch;
   hasTelemetryUnixEpochSeconds = latestTelemetryUnixEpochSeconds != 0;
 
   validPacketCount++;
@@ -326,8 +388,7 @@ void processI2CFrame(const I2CFrame &frame) {
   }
 
   if (isStartFrame) {
-    discardPartialPacket("new telemetry packet started before 98 bytes were received");
-    telemetryBufferLength = 0;
+    discardPartialPacket("new telemetry packet started before previous packet was complete");
     receivingPacket = true;
     lastPacketFrameMillis = millis();
   } else if (!receivingPacket) {
@@ -340,18 +401,18 @@ void processI2CFrame(const I2CFrame &frame) {
     return;
   }
 
-  if (telemetryBufferLength + payloadSize > TELEMETRY_PACKET_SIZE) {
-    discardPartialPacket("I2C frame would overflow 98-byte telemetry buffer");
+  if (i2cTelemetryBytesReceived + payloadSize > TELEMETRY_PACKET_SIZE) {
+    discardPartialPacket("I2C frame would overflow telemetry buffer");
     return;
   }
 
-  memcpy(telemetryBuffer + telemetryBufferLength, payload, payloadSize);
-  telemetryBufferLength += payloadSize;
+  memcpy(i2cTelemetryBytes() + i2cTelemetryBytesReceived, payload, payloadSize);
+  i2cTelemetryBytesReceived += payloadSize;
   lastPacketFrameMillis = millis();
 
-  if (telemetryBufferLength == TELEMETRY_PACKET_SIZE) {
+  if (i2cTelemetryBytesReceived == TELEMETRY_PACKET_SIZE) {
     markTelemetryPacketReady();
-    telemetryBufferLength = 0;
+    i2cTelemetryBytesReceived = 0;
     receivingPacket = false;
     lastPacketFrameMillis = 0;
   }
@@ -439,7 +500,7 @@ void processQueuedI2CFrames() {
 
   if (receivingPacket && lastPacketFrameMillis != 0 &&
       millis() - lastPacketFrameMillis > PACKET_RECEIVE_TIMEOUT_MS) {
-    discardPartialPacket("timed out before 98 bytes were received");
+    discardPartialPacket("timed out before full telemetry packet received");
   }
 }
 
@@ -512,7 +573,8 @@ void setup() {
 
   Wire.begin(I2C_RECEIVE_ADDRESS);
   Wire.onReceive(receiveI2C);
-  memcpy((void*)lora_tx_buffer.callsign, CALLSIGN, LORA_CALLSIGN_SIZE);
+  memcpy((void *)lora_tx_buffer.callsign, CALLSIGN, LORA_CALLSIGN_SIZE);
+  lora_tx_buffer.stage_id[0] = (uint8_t)SLOT_TYPE;
 
   Serial.println("System Initialized");
 }

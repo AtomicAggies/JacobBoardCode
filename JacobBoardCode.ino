@@ -10,15 +10,31 @@
 
 #define TX_CYCLE_MS 1400
 
+#define SLOT_BOOSTER_START 0
 #define SLOT_SUSTAINER_START 450
+#define SLOT_PAYLOAD_START 800
+#define SLOT_PADDING 50
 #define SLOT_DURATION        350
+
+// Define which slot we are using for this board
+// 0 = booster
+// 1 = sustainer
+// 2 = payload
+#define SLOT_TYPE 1
 
 #define RF95_FREQ 434.0
 
 #define RFM95_CS 10
 #define RFM95_RST 2
 #define RFM95_INT 3
-#define epoch 1400 //epoch in ms
+// Epoch length in milliseconds.
+// Recommended range: 1000..10000 ms.
+// Choose it from slot planning math:
+//   slot_spacing_ms = EPOCH
+//   must satisfy slot_spacing_ms >= LoRa airtime_ms + guard_ms
+// Example: 180 ms airtime + 10 ms guard => EPOCH >= 190 ms
+// (then pick a larger practical value like 1400 ms for sparse traffic).
+#define EPOCH 1400
 
 #define CALLSIGN "KJ5NPP"
 
@@ -27,6 +43,12 @@ RH_RF95 rf95(RFM95_CS, RFM95_INT);
 
 // Adjustable send window (DEFAULT = 40 ms)
 uint32_t TX_READY_WINDOW_MS = 40;
+
+// Define the start time of the slot for this board
+uint32_t SLOT_START =
+  SLOT_TYPE == 0 ? SLOT_BOOSTER_START :
+  SLOT_TYPE == 1 ? SLOT_SUSTAINER_START :
+  SLOT_TYPE == 2 ? SLOT_PAYLOAD_START : 0;
 
 // I2C framing. This matches SpencerBoardCode's telemetry sender and
 // AbrahamBoardCode's receiver: Spencer sends a 98-byte telemetry packet as
@@ -48,6 +70,7 @@ const uint8_t I2C_FRAME_DESTINATION_RADIO = 1 << 1;
 const uint8_t I2C_FRAME_START = 1 << 7;
 const uint8_t FRAME_QUEUE_SIZE = 8;
 const unsigned long PACKET_RECEIVE_TIMEOUT_MS = 1000;
+const uint8_t TELEMETRY_OFFSET_GPS_UNIX_EPOCH = 27;
 
 struct I2CFrame {
   uint8_t length;
@@ -84,6 +107,8 @@ IntervalTimer txWindowOpenTimer;
 IntervalTimer txWindowCloseTimer;
 volatile bool txWindowOpen = false;
 volatile bool txWindowSendArmed = false;
+uint32_t latestTelemetryUnixEpochSeconds = 0;
+bool hasTelemetryUnixEpochSeconds = false;
 
 // ========== 64-bit cycle counter ==========
 volatile uint32_t last_cycle_low = 0;
@@ -142,6 +167,11 @@ void onTxWindowClose() {
   txWindowSendArmed = false;
 }
 
+uint32_t readLeUint32(const uint8_t *bytes) {
+  return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+         ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
 // ========== HANDLE PPS ==========
 void handlePPS(uint64_t now) {
   cycle_start_cycles = now;  // Anchor TX cycle to PPS
@@ -168,9 +198,31 @@ void handlePPS(uint64_t now) {
   txWindowSendArmed = false;
   txWindowOpenTimer.end();
   txWindowCloseTimer.end();
-  txWindowOpenTimer.begin(onTxWindowOpen, SLOT_SUSTAINER_START * 1000);
-  txWindowCloseTimer.begin(onTxWindowClose,
-                           (SLOT_SUSTAINER_START + TX_READY_WINDOW_MS) * 1000);
+
+  if (!hasTelemetryUnixEpochSeconds || EPOCH == 0) {
+    return;
+  }
+
+  uint64_t unixMsAtPps = (uint64_t)latestTelemetryUnixEpochSeconds * 1000ULL;
+  uint32_t epochPhaseMs = (uint32_t)(unixMsAtPps % EPOCH);
+  uint32_t slotPhaseMs = (uint32_t)(SLOT_START % EPOCH);
+  uint32_t timeToSlotMs = 0;
+  if (epochPhaseMs <= slotPhaseMs) {
+    timeToSlotMs = slotPhaseMs - epochPhaseMs;
+  } else {
+    timeToSlotMs = EPOCH - (epochPhaseMs - slotPhaseMs);
+  }
+
+  if (timeToSlotMs >= 1000) {
+    return;
+  }
+
+  txWindowOpenTimer.begin(onTxWindowOpen, timeToSlotMs * 1000);
+  uint32_t closeDelayMs = timeToSlotMs + TX_READY_WINDOW_MS;
+  if (closeDelayMs > 999) {
+    closeDelayMs = 999;
+  }
+  txWindowCloseTimer.begin(onTxWindowClose, closeDelayMs * 1000);
 }
 
 // ========== TIME SINCE PPS ==========
@@ -233,6 +285,9 @@ void markTelemetryPacketReady() {
   memcpy((void*)lora_tx_buffer.telemetry, telemetryBuffer, TELEMETRY_PACKET_SIZE);
   packet_ready = true;
   interrupts();
+  latestTelemetryUnixEpochSeconds =
+      readLeUint32(telemetryBuffer + TELEMETRY_OFFSET_GPS_UNIX_EPOCH);
+  hasTelemetryUnixEpochSeconds = latestTelemetryUnixEpochSeconds != 0;
 
   validPacketCount++;
   Serial.print("Telemetry packet ready for LoRa TX: ");

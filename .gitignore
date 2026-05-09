@@ -1,0 +1,22 @@
+.vscode/
+*.tmp
+*.temp
+*.swp
+*.bak
+*.orig
+Thumbs.db
+Desktop.ini
+
+# Build/test outputs
+build/
+dist/
+out/
+tmp/
+
+# Arduino / embedded generated artifacts
+*.elf
+*.hex
+*.bin
+*.map
+*.eep
+*.lst

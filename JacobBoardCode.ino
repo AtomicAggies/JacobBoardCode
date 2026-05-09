@@ -27,9 +27,9 @@ uint32_t TX_READY_WINDOW_MS = 40;
 
 // I2C framing. This matches SpencerBoardCode's telemetry sender and
 // AbrahamBoardCode's receiver: Spencer sends a 98-byte telemetry packet as
-// multiple 32-byte I2C frames addressed to the broadcast/general-call address.
+// multiple 32-byte I2C frames addressed to this board's I2C slave address.
 const uint8_t TELEMETRY_PACKET_SIZE = 98;
-const uint8_t I2C_RECEIVE_ADDRESS = 0x00;
+const uint8_t I2C_RECEIVE_ADDRESS = 0x08;
 const uint8_t I2C_FRAME_MAX_SIZE = 32;
 const uint8_t I2C_FRAME_HEADER_SIZE = 2;
 const uint8_t I2C_FRAME_PAYLOAD_SIZE = I2C_FRAME_MAX_SIZE - I2C_FRAME_HEADER_SIZE;

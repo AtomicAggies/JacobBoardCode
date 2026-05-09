@@ -300,14 +300,28 @@ void receiveI2C(int count) {
 
   I2CFrame &frame = frameQueue[frameQueueHead];
   frame.length = 0;
+  bool isForRadio = false;
   while (Wire.available()) {
     uint8_t byteValue = Wire.read();
     if (frame.length < I2C_FRAME_MAX_SIZE) {
       frame.bytes[frame.length++] = byteValue;
+      if (frame.length == 1) {
+        isForRadio = (byteValue & I2C_FRAME_DESTINATION_RADIO) != 0;
+      }
     } else {
       droppedFrameCount++;
     }
   }
+
+  if (frame.length < I2C_FRAME_HEADER_SIZE) {
+    return;
+  }
+
+  if (!isForRadio) {
+    ignoredFrameCount++;
+    return;
+  }
+
   frameQueueHead = nextHead;
 }
 

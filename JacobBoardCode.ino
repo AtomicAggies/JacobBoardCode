@@ -19,6 +19,8 @@
 #define RFM95_INT 3
 #define epoch 1400 //epoch in ms
 
+#define CALLSIGN "KJ5NPP"
+
 // Singleton instance of the radio driver
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
 
@@ -29,6 +31,7 @@ uint32_t TX_READY_WINDOW_MS = 40;
 // AbrahamBoardCode's receiver: Spencer sends a 98-byte telemetry packet as
 // multiple 32-byte I2C frames addressed to this board's I2C slave address.
 const uint8_t TELEMETRY_PACKET_SIZE = 98;
+const uint8_t LORA_CALLSIGN_SIZE = 6;
 const uint8_t I2C_RECEIVE_ADDRESS = 0x08;
 const uint8_t I2C_FRAME_MAX_SIZE = 32;
 const uint8_t I2C_FRAME_HEADER_SIZE = 2;
@@ -50,6 +53,14 @@ struct I2CFrame {
   uint8_t bytes[I2C_FRAME_MAX_SIZE];
 };
 
+struct __attribute__((packed)) LoRaTransmitPacket {
+  uint8_t callsign[LORA_CALLSIGN_SIZE];
+  uint8_t telemetry[TELEMETRY_PACKET_SIZE];
+};
+
+static_assert(sizeof(LoRaTransmitPacket) == LORA_CALLSIGN_SIZE + TELEMETRY_PACKET_SIZE,
+              "LoRaTransmitPacket size mismatch");
+
 volatile uint8_t frameQueueHead = 0;
 volatile uint8_t frameQueueTail = 0;
 volatile uint16_t droppedFrameCount = 0;
@@ -60,7 +71,7 @@ uint8_t telemetryBufferLength = 0;
 bool receivingPacket = false;
 unsigned long lastPacketFrameMillis = 0;
 
-volatile uint8_t tx_buffer[TELEMETRY_PACKET_SIZE];
+volatile LoRaTransmitPacket lora_tx_buffer;
 volatile bool packet_ready = false;
 
 uint32_t validPacketCount = 0;
@@ -194,7 +205,7 @@ void discardPartialPacket(const char *reason) {
 
 void markTelemetryPacketReady() {
   noInterrupts();
-  memcpy((void*)tx_buffer, telemetryBuffer, TELEMETRY_PACKET_SIZE);
+  memcpy((void*)lora_tx_buffer.telemetry, telemetryBuffer, TELEMETRY_PACKET_SIZE);
   packet_ready = true;
   interrupts();
 
@@ -382,13 +393,13 @@ void handleTransmission() {
         t <= (SLOT_SUSTAINER_START + TX_READY_WINDOW_MS)) {
 
       if (packet_ready) {
-        uint8_t tx_copy[TELEMETRY_PACKET_SIZE];
+        LoRaTransmitPacket tx_copy;
 
         noInterrupts();
-        memcpy(tx_copy, (const void*)tx_buffer, TELEMETRY_PACKET_SIZE);
+        memcpy(&tx_copy, (const void*)&lora_tx_buffer, sizeof(tx_copy));
         interrupts();
 
-        if (sendLoRa(tx_copy, TELEMETRY_PACKET_SIZE)) {
+        if (sendLoRa(reinterpret_cast<uint8_t*>(&tx_copy), sizeof(tx_copy))) {
           noInterrupts();
           packet_ready = false;
           interrupts();
@@ -434,6 +445,7 @@ void setup() {
 
   Wire.begin(I2C_RECEIVE_ADDRESS);
   Wire.onReceive(receiveI2C);
+  memcpy((void*)lora_tx_buffer.callsign, CALLSIGN, LORA_CALLSIGN_SIZE);
 
   Serial.println("System Initialized");
 }
@@ -455,25 +467,25 @@ void loop() {
   handleTransmission();
 
   // Debug timing output (optional)
-  static uint32_t lastPrint = 0;
-  if (millis() - lastPrint > 500) {
-    lastPrint = millis();
+  // static uint32_t lastPrint = 0;
+  // if (millis() - lastPrint > 500) {
+  //   lastPrint = millis();
 
-    Serial.print("UTC: ");
-    Serial.print(utc_seconds);
-    Serial.print(" | Cycle ms: ");
-    Serial.print(getCycleTimeMs());
-    Serial.print(" | Window(ms): ");
-    Serial.print(TX_READY_WINDOW_MS);
-    Serial.print(" | Ready: ");
-    Serial.print(packet_ready ? "yes" : "no");
-    Serial.print(" | Valid: ");
-    Serial.print(validPacketCount);
-    Serial.print(" | Invalid: ");
-    Serial.print(invalidPacketCount);
-    Serial.print(" | Ignored: ");
-    Serial.print(ignoredFrameCount);
-    Serial.print(" | Checksum failures: ");
-    Serial.println(checksumFailureCount);
-  }
+  //   Serial.print("UTC: ");
+  //   Serial.print(utc_seconds);
+  //   Serial.print(" | Cycle ms: ");
+  //   Serial.print(getCycleTimeMs());
+  //   Serial.print(" | Window(ms): ");
+  //   Serial.print(TX_READY_WINDOW_MS);
+  //   Serial.print(" | Ready: ");
+  //   Serial.print(packet_ready ? "yes" : "no");
+  //   Serial.print(" | Valid: ");
+  //   Serial.print(validPacketCount);
+  //   Serial.print(" | Invalid: ");
+  //   Serial.print(invalidPacketCount);
+  //   Serial.print(" | Ignored: ");
+  //   Serial.print(ignoredFrameCount);
+  //   Serial.print(" | Checksum failures: ");
+  //   Serial.println(checksumFailureCount);
+  // }
 }

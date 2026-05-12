@@ -27,7 +27,18 @@ Use **115200** baud in your serial terminal. **Do not** connect 5 V TTL UART lin
 ### Other useful pins (reference)
 
 - **PPS**: pin **8** (input) — GPS pulse-per-second for timing.
-- **LoRa**: see `JacobBoardCode.ino` for `RFM95_CS`, `RFM95_RST`, `RFM95_INT`.
+- **LoRa (defaults in `JacobBoardCode.ino`)**:
+  - **CS** → pin **10**
+  - **RST** → pin **2**
+  - **DIO0 / IRQ** → pin **3** (`RFM95_INT`) — must reach the SX127x **DIO0** pad so RadioHead gets **TX done**. If this wire is wrong or missing, firmware used to **hang forever** after `rf95.send()`; it now **times out** after a few seconds, prints an error, and calls `setModeIdle()`.
+
+### LoRa “freeze” right after `rf95.send()`
+
+RadioHead blocks in `waitPacketSent()` until the RFM95 **DIO0** interrupt fires (pin **3** on this sketch). If the console prints `rf95.send(), len=...` and then nothing until a timeout message:
+
+1. Confirm **DIO0** on the module is wired to Teensy **pin 3** (not DIO1-only boards used as if they were DIO0).
+2. Confirm **SPI** (MOSI/MISO/SCK + CS **10**) and **3.3 V** to the module.
+3. Keep USB–UART **RX on pin 1** only; accidentally routing UART onto the LoRa IRQ pin can break interrupts.
 
 ### Related repos
 

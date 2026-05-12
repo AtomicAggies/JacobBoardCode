@@ -36,6 +36,12 @@ static_assert(offsetof(TelemetryData, bmp) == 32,
 #define RFM95_CS 10
 #define RFM95_RST 2
 #define RFM95_INT 3
+
+/** Max wait for TX-done (DIO0 IRQ); match slot duration so TX window and watchdog align. */
+#define LORA_WAIT_PACKET_SENT_TIMEOUT_MS (SLOT_DURATION)
+static_assert(LORA_WAIT_PACKET_SENT_TIMEOUT_MS <= 65535,
+              "LORA_WAIT_PACKET_SENT_TIMEOUT_MS must fit RadioHead uint16_t timeout");
+
 // Epoch length in milliseconds.
 // Recommended range: 1000..10000 ms.
 // Choose it from slot planning math:
@@ -55,8 +61,16 @@ static_assert(offsetof(TelemetryData, bmp) == 32,
 #define JACOB_I2C_TELEMETRY_VERBOSE 0
 #endif
 
-// Singleton instance of the radio driver
-RH_RF95 rf95(RFM95_CS, RFM95_INT);
+// RadioHead marks handleInterrupt() protected on some releases; subclass for
+// TX-done polling when the DIO0 GPIO edge is missed.
+class JacobRH_RF95 : public RH_RF95 {
+public:
+  JacobRH_RF95(uint8_t slaveSelectPin, uint8_t interruptPin)
+      : RH_RF95(slaveSelectPin, interruptPin) {}
+  void pollRadioInterrupts() { handleInterrupt(); }
+};
+
+JacobRH_RF95 rf95(RFM95_CS, RFM95_INT);
 
 // Adjustable send window (DEFAULT = 40 ms)
 uint32_t TX_READY_WINDOW_MS = 40;
@@ -701,11 +715,78 @@ void processQueuedI2CFrames() {
   }
 }
 
+// ========== LORA SPI / register diagnostics (RadioHead-compatible framing) ==========
+static uint8_t loraSpiReadReg8(uint8_t reg) {
+  uint8_t v;
+  noInterrupts();
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(RFM95_CS, LOW);
+  SPI.transfer(static_cast<uint8_t>(reg & ~RH_SPI_WRITE_MASK));
+  v = SPI.transfer(0);
+  digitalWrite(RFM95_CS, HIGH);
+  SPI.endTransaction();
+  interrupts();
+  return v;
+}
+
+/** Log chip ID, mode, IRQ flags, and DIO0 pin level (SPI OK usually implies VERSION 0x12). */
+static void logLoRaRadioSnapshot(const char *reason) {
+  uint8_t ver = loraSpiReadReg8(RH_RF95_REG_42_VERSION);
+  uint8_t op = loraSpiReadReg8(RH_RF95_REG_01_OP_MODE);
+  uint8_t irq = loraSpiReadReg8(RH_RF95_REG_12_IRQ_FLAGS);
+  int dio0 = digitalRead(RFM95_INT);
+
+  Serial1.print("[LoRa dbg] ");
+  Serial1.print(reason);
+  Serial1.print(" VERSION=0x");
+  if (ver < 16) {
+    Serial1.print('0');
+  }
+  Serial1.print(ver, HEX);
+  Serial1.print(" OP_MODE=0x");
+  if (op < 16) {
+    Serial1.print('0');
+  }
+  Serial1.print(op, HEX);
+  Serial1.print(" IRQ_FLAGS=0x");
+  if (irq < 16) {
+    Serial1.print('0');
+  }
+  Serial1.print(irq, HEX);
+  Serial1.print(" TX_DONE_in_IRQ=");
+  Serial1.print((irq & RH_RF95_TX_DONE) ? 1 : 0);
+  Serial1.print(" DIO0_pin=");
+  Serial1.print(dio0);
+  if (ver == 0x00 || ver == 0xff) {
+    Serial1.print(" (VERSION 0x00/0xFF often means MISO/CS/SPI mode wiring)");
+  }
+  Serial1.println();
+}
+
 // ========== LORA SEND ==========
 bool sendLoRa(uint8_t *data, uint8_t len) {
   if (!loraReady) {
     Serial1.println("[LoRa] TX skipped (radio not initialized)");
     return false;
+  }
+
+  // rf95.send() starts with waitPacketSent() for any in-flight TX — bound it so a
+  // lost DIO0 IRQ cannot deadlock before the new packet is queued.
+  interrupts();
+  if (!rf95.waitPacketSent(LORA_WAIT_PACKET_SENT_TIMEOUT_MS)) {
+    // RISING on DIO0 can miss TX-done; chip may still have TX_DONE in IRQ_FLAGS.
+    uint8_t irqPre = loraSpiReadReg8(RH_RF95_REG_12_IRQ_FLAGS);
+    if (irqPre & RH_RF95_TX_DONE) {
+      rf95.pollRadioInterrupts();
+    }
+    if (!rf95.waitPacketSent(2)) {
+      Serial1.print("[LoRa] warning: radio still in TX after ");
+      Serial1.print(LORA_WAIT_PACKET_SENT_TIMEOUT_MS);
+      Serial1.println(
+          " ms — snapshot then forcing idle (GPIO IRQ path suspect)");
+      logLoRaRadioSnapshot("stuck TX before send()");
+      rf95.setModeIdle();
+    }
   }
 
   Serial1.print("[LoRa] rf95.send(), len=");
@@ -717,8 +798,42 @@ bool sendLoRa(uint8_t *data, uint8_t len) {
     return false;
   }
 
-  rf95.waitPacketSent();
-  Serial1.println("[LoRa] waitPacketSent() done (on air)");
+  // RadioHead clears RHModeTx from DIO0 ISR only; RISING can miss. Poll IRQ_FLAGS
+  // within the same slot-duration budget so we do not wait the full timeout when
+  // TX_DONE is already set (common when the GPIO edge is missed).
+  interrupts();
+  const uint32_t txWaitT0 = millis();
+  bool txDoneSynced = false;
+  while ((millis() - txWaitT0) < LORA_WAIT_PACKET_SENT_TIMEOUT_MS) {
+    uint8_t irq = loraSpiReadReg8(RH_RF95_REG_12_IRQ_FLAGS);
+    if (irq & RH_RF95_TX_DONE) {
+      rf95.pollRadioInterrupts();
+      if (rf95.waitPacketSent(2)) {
+        txDoneSynced = true;
+        break;
+      }
+    }
+    if (rf95.waitPacketSent(1)) {
+      txDoneSynced = true;
+      break;
+    }
+    yield();
+  }
+  if (!txDoneSynced) {
+    uint8_t irqPoll = loraSpiReadReg8(RH_RF95_REG_12_IRQ_FLAGS);
+    if (irqPoll & RH_RF95_TX_DONE) {
+      rf95.pollRadioInterrupts();
+      txDoneSynced = rf95.waitPacketSent(2);
+    }
+  }
+  if (!txDoneSynced) {
+    Serial1.print("[LoRa] ERROR: TX wait failed after ");
+    Serial1.print(LORA_WAIT_PACKET_SENT_TIMEOUT_MS);
+    Serial1.println(" ms (slot duration) — snapshot then idle.");
+    logLoRaRadioSnapshot("TX-done wait timeout");
+    rf95.setModeIdle();
+    return false;
+  }
   return true;
 }
 
@@ -796,6 +911,7 @@ void setup() {
     rf95.setTxPower(23, false);
     loraReady = true;
     Serial1.println("LoRa radio initialized");
+    logLoRaRadioSnapshot("after init (expect VERSION=0x12 for SX1276/78)");
   }
 
   Wire1.begin(I2C_RECEIVE_ADDRESS);
@@ -843,27 +959,4 @@ void loop() {
   }
 
   processScheduledTransmission();
-
-  // Debug timing output (optional)
-  // static uint32_t lastPrint = 0;
-  // if (millis() - lastPrint > 500) {
-  //   lastPrint = millis();
-
-  //   Serial1.print("UTC: ");
-  //   Serial1.print(utc_seconds);
-  //   Serial1.print(" | Cycle ms: ");
-  //   Serial1.print(getCycleTimeMs());
-  //   Serial1.print(" | Window(ms): ");
-  //   Serial1.print(TX_READY_WINDOW_MS);
-  //   Serial1.print(" | Ready: ");
-  //   Serial1.print(packet_ready ? "yes" : "no");
-  //   Serial1.print(" | Valid: ");
-  //   Serial1.print(validPacketCount);
-  //   Serial1.print(" | Invalid: ");
-  //   Serial1.print(invalidPacketCount);
-  //   Serial1.print(" | Ignored: ");
-  //   Serial1.print(ignoredFrameCount);
-  //   Serial1.print(" | Checksum failures: ");
-  //   Serial1.println(checksumFailureCount);
-  // }
 }

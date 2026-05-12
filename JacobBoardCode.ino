@@ -52,8 +52,8 @@ uint32_t SLOT_START =
   SLOT_TYPE == 1 ? SLOT_SUSTAINER_START :
   SLOT_TYPE == 2 ? SLOT_PAYLOAD_START : 0;
 
-// I2C framing. Spencer broadcasts the same framed telemetry for SD and radio
-// peers; this board accepts frames marked for SD or radio (see header bit 0/1).
+// I2C framing. Spencer sends framed chunks to this slave (0x08). Destination
+// flags in byte 0: this board accepts SD or radio (see bits 0/1).
 const uint8_t LORA_CALLSIGN_SIZE = 6;
 const uint8_t I2C_RECEIVE_ADDRESS = 0x08;
 const uint8_t I2C_FRAME_MAX_SIZE = 32;

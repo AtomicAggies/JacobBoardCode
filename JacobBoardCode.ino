@@ -4,6 +4,14 @@
 #include <Wire.h>
 #include <RH_RF95.h>
 #include <TelemetryData.h>
+#include <cstddef>
+#include <cstring>
+
+// Must match TelemetryData.h; if this fails, Jacob will mis-decode GPS unix.
+static_assert(offsetof(TelemetryData, gps) + offsetof(GPSData, unixEpoch) == 28,
+              "GPS unixEpoch wire offset must be 28 (see TelemetryData.h)");
+static_assert(offsetof(TelemetryData, bmp) == 32,
+              "BMP wire offset must be 32 (unixEpoch ends at byte 31)");
 
 // ================= CONFIG =================
 #define PPS_PIN   8
@@ -21,7 +29,6 @@
 // Define which slot we are using for this board
 // 0 = booster
 // 1 = sustainer
-// 2 = payload
 #define SLOT_TYPE 1
 
 #define RF95_FREQ 434.0
@@ -39,6 +46,14 @@
 #define EPOCH 1400
 
 #define CALLSIGN "KJ5NPP"
+
+// Uncomment for heavy Serial1 tracing (hex dumps, queue depth, epoch hints):
+// #define JACOB_I2C_TELEMETRY_VERBOSE 1
+// Set to 1 for Serial1 hex dumps and layout checks (very chatty — enable only
+// while diagnosing; can affect timing / queue draining).
+#ifndef JACOB_I2C_TELEMETRY_VERBOSE
+#define JACOB_I2C_TELEMETRY_VERBOSE 0
+#endif
 
 // Singleton instance of the radio driver
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
@@ -71,7 +86,10 @@ const uint8_t I2C_FRAME_DESTINATION_RADIO = 1 << 1;
 const uint8_t I2C_FRAME_DESTINATION_SD_OR_RADIO =
     I2C_FRAME_DESTINATION_SD | I2C_FRAME_DESTINATION_RADIO;
 const uint8_t I2C_FRAME_START = 1 << 7;
-const uint8_t FRAME_QUEUE_SIZE = 8;
+// Spencer sends 3 frames per Jacob burst (76-byte telemetry); bursts can stack
+// faster than loop() drains. Undersized queue drops middle frames and START
+// resets reassembly — unixEpoch straddles chunk 1/2 so it often reads as 0.
+const uint8_t FRAME_QUEUE_SIZE = 32;
 const uint8_t TELEMETRY_RING_SIZE = 5;
 const unsigned long PACKET_RECEIVE_TIMEOUT_MS = 1000;
 
@@ -126,6 +144,7 @@ IntervalTimer txWindowCloseTimer;
 volatile bool txWindowOpen = false;
 volatile bool txWindowSendArmed = false;
 uint32_t latestTelemetryUnixEpochSeconds = 0;
+/** True when latestTelemetryUnixEpochSeconds is from a full packet, GPS valid bit set, and in range. */
 bool hasTelemetryUnixEpochSeconds = false;
 
 // ========== 64-bit cycle counter ==========
@@ -156,6 +175,7 @@ const double Kf = 1e-12;
 const double Kp = 1e-3;
 
 // ========== UTC ==========
+// Wall-clock seconds from GPS when valid; not advanced on PPS unless we have a valid unix snapshot.
 uint64_t utc_seconds = 0;
 
 // ========== TX CYCLE SYNC ==========
@@ -198,14 +218,17 @@ void handlePPS(uint64_t now) {
     freq_correction += Kf * error;
     phase_correction += Kp * error;
 
-    Serial.print("PPS delta: ");
-    Serial.print((uint32_t)delta);
-    Serial.print(" error: ");
-    Serial.println(error);
+    Serial1.print("PPS delta: ");
+    Serial1.print((uint32_t)delta);
+    Serial1.print(" error: ");
+    Serial1.println(error);
   }
 
   last_pps_cycles = now;
-  utc_seconds++;
+
+  if (hasTelemetryUnixEpochSeconds) {
+    utc_seconds = latestTelemetryUnixEpochSeconds;
+  }
 
   txWindowOpen = false;
   txWindowSendArmed = false;
@@ -213,9 +236,12 @@ void handlePPS(uint64_t now) {
   txWindowCloseTimer.end();
 
   if (!hasTelemetryUnixEpochSeconds || EPOCH == 0) {
-    Serial.println("PPS: skip LoRa slot scheduling (no GPS unix yet or EPOCH=0)");
+    Serial1.println(
+        "PPS: skip LoRa slot scheduling (no valid GPS unix epoch flag/range or "
+        "EPOCH=0)");
     return;
   }
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
 
   uint64_t unixMsAtPps = (uint64_t)latestTelemetryUnixEpochSeconds * 1000ULL;
   uint32_t epochPhaseMs = (uint32_t)(unixMsAtPps % EPOCH);
@@ -227,22 +253,22 @@ void handlePPS(uint64_t now) {
     timeToSlotMs = EPOCH - (epochPhaseMs - slotPhaseMs);
   }
 
-  if (timeToSlotMs >= 1000) {
-    return;
-  }
+  // timeToSlotMs is in [0, EPOCH); must allow scheduling up to almost EPOCH ms
+  // (EPOCH may exceed 1000 ms — the old >= 1000 check broke TDM for EPOCH=1400).
 
-  Serial.print("PPS: scheduling LoRa TX window in ");
-  Serial.print(timeToSlotMs);
-  Serial.print(" ms (slot phase ");
-  Serial.print(SLOT_START);
-  Serial.println(" ms)");
+  Serial1.print("PPS: scheduling LoRa TX window in ");
+  Serial1.print(timeToSlotMs);
+  Serial1.print(" ms (epoch phase ");
+  Serial1.print(epochPhaseMs);
+  Serial1.print(" ms, slot ");
+  Serial1.print(SLOT_START);
+  Serial1.print(" ms, unix=");
+  Serial1.print(latestTelemetryUnixEpochSeconds);
+  Serial1.println(")");
 
-  txWindowOpenTimer.begin(onTxWindowOpen, timeToSlotMs * 1000);
-  uint32_t closeDelayMs = timeToSlotMs + TX_READY_WINDOW_MS;
-  if (closeDelayMs > 999) {
-    closeDelayMs = 999;
-  }
-  txWindowCloseTimer.begin(onTxWindowClose, closeDelayMs * 1000);
+  txWindowOpenTimer.begin(onTxWindowOpen, timeToSlotMs * 1000ul);
+  const uint32_t closeDelayUs = (timeToSlotMs + TX_READY_WINDOW_MS) * 1000ul;
+  txWindowCloseTimer.begin(onTxWindowClose, closeDelayUs);
 }
 
 // ========== TIME SINCE PPS ==========
@@ -301,15 +327,104 @@ uint8_t checksumI2CPayload(const uint8_t *payload, uint8_t payloadSize) {
   return checksum;
 }
 
+/** GPS unix from a full wire record: VALIDITY_GPS_UNIX_EPOCH, range, memcpy epoch. */
+static constexpr uint32_t kGpsUnixMinPlausible = 946684800UL;   // 2000-01-01 UTC
+static constexpr uint32_t kGpsUnixMaxPlausible = 4102444800UL;  // ~2099
+
+bool gpsUnixFromWireRecord(const uint8_t *wire, uint8_t wireBytes,
+                           uint32_t *outUnix) {
+  if (wireBytes < offsetof(TelemetryData, bmp) || outUnix == nullptr) {
+    return false;
+  }
+  if ((wire[3] & VALIDITY_GPS_UNIX_EPOCH) == 0) {
+    return false;
+  }
+  constexpr size_t kUnixOff =
+      offsetof(TelemetryData, gps) + offsetof(GPSData, unixEpoch);
+  uint32_t unixEpoch = 0;
+  memcpy(&unixEpoch, wire + kUnixOff, sizeof(uint32_t));
+  if (unixEpoch < kGpsUnixMinPlausible || unixEpoch > kGpsUnixMaxPlausible) {
+    return false;
+  }
+  *outUnix = unixEpoch;
+  return true;
+}
+
+#if JACOB_I2C_TELEMETRY_VERBOSE
+void logVerboseAssembledTelemetry(const uint8_t *wire, uint8_t wireBytes,
+                                  uint32_t unixFromStruct) {
+  constexpr size_t kUnixOff =
+      offsetof(TelemetryData, gps) + offsetof(GPSData, unixEpoch);
+  uint32_t unixFromBytes = 0;
+  if (wireBytes >= kUnixOff + sizeof(uint32_t)) {
+    memcpy(&unixFromBytes, wire + kUnixOff, sizeof(uint32_t));
+  }
+
+  Serial1.println("[I2C dbg] --- assembled packet dump ---");
+  Serial1.print("[I2C dbg] wireBytes=");
+  Serial1.print(wireBytes);
+  Serial1.print(" unix@");
+  Serial1.print((unsigned)kUnixOff);
+  Serial1.print(" struct=");
+  Serial1.print(unixFromStruct);
+  Serial1.print(" memcpy=");
+  Serial1.print(unixFromBytes);
+  if (unixFromStruct != unixFromBytes) {
+    Serial1.print(" MISMATCH");
+  }
+  Serial1.println();
+
+  if (wireBytes >= 4) {
+    uint16_t ctr = (uint16_t)wire[1] | ((uint16_t)wire[2] << 8);
+    Serial1.print("[I2C dbg] pkt ctr=");
+    Serial1.print(ctr);
+    Serial1.print(" validity=0x");
+    Serial1.println(wire[3], HEX);
+  }
+  if (wireBytes >= offsetof(TelemetryData, gps) + sizeof(int32_t)) {
+    int32_t lat = 0;
+    memcpy(&lat,
+           wire + offsetof(TelemetryData, gps) + offsetof(GPSData, latitude),
+           sizeof(lat));
+    Serial1.print("[I2C dbg] lat(1e7)=");
+    Serial1.println(lat);
+  }
+
+  Serial1.print("[I2C dbg] hex[0..15]: ");
+  for (size_t i = 0; i < 16 && i < wireBytes; i++) {
+    if (i) Serial1.print(' ');
+    if (wire[i] < 16) Serial1.print('0');
+    Serial1.print(wire[i], HEX);
+  }
+  Serial1.println();
+  Serial1.print("[I2C dbg] hex[24..39] (NED end + unix + BMP start): ");
+  for (size_t i = 24; i < 40 && i < wireBytes; i++) {
+    if (i > 24) Serial1.print(' ');
+    if (wire[i] < 16) Serial1.print('0');
+    Serial1.print(wire[i], HEX);
+  }
+  Serial1.println();
+  Serial1.println("[I2C dbg] --- end dump ---");
+}
+#endif
+
 void discardPartialPacket(const char *reason) {
   if (receivingPacket || i2cTelemetryBytesReceived > 0) {
     invalidPacketCount++;
-    Serial.print("Discarded partial telemetry packet (");
-    Serial.print(i2cTelemetryBytesReceived);
-    Serial.print("/");
-    Serial.print(TELEMETRY_PACKET_MAX_BYTES);
-    Serial.print(" bytes): ");
-    Serial.println(reason);
+    Serial1.print("Discarded partial telemetry packet (");
+    Serial1.print(i2cTelemetryBytesReceived);
+    Serial1.print("/");
+    Serial1.print(TELEMETRY_PACKET_MAX_BYTES);
+    Serial1.print(" bytes): ");
+    Serial1.println(reason);
+#if JACOB_I2C_TELEMETRY_VERBOSE
+    if (strstr(reason, "new telemetry packet started") != nullptr &&
+        i2cTelemetryBytesReceived > 0 && i2cTelemetryBytesReceived < 76) {
+      Serial1.println(
+          "[I2C dbg] hint: unixEpoch bytes 28-31 span I2C chunk1/chunk2; a "
+          "START here often means queue overflow or slow loop vs Spencer rate.");
+    }
+#endif
   }
 
   i2cTelemetryBytesReceived = 0;
@@ -325,12 +440,23 @@ void markTelemetryPacketReady(uint8_t wireBytes) {
   telemetryRingWriteNext =
       (telemetryRingWriteNext + 1) % TELEMETRY_RING_SIZE;
 
-  if (wireBytes >= offsetof(TelemetryData, bmp)) {
-    latestTelemetryUnixEpochSeconds = i2cTelemetryBuffer.gps.unixEpoch;
-    hasTelemetryUnixEpochSeconds = latestTelemetryUnixEpochSeconds != 0;
+  const uint8_t *wire = i2cTelemetryBytes();
+  uint32_t validatedUnix = 0;
+  const bool unixOk = gpsUnixFromWireRecord(wire, wireBytes, &validatedUnix);
+
+  if (unixOk) {
+    latestTelemetryUnixEpochSeconds = validatedUnix;
+    hasTelemetryUnixEpochSeconds = true;
   } else {
     hasTelemetryUnixEpochSeconds = false;
   }
+
+#if JACOB_I2C_TELEMETRY_VERBOSE
+  if (wireBytes >= offsetof(TelemetryData, bmp)) {
+    logVerboseAssembledTelemetry(wire, wireBytes,
+                                 i2cTelemetryBuffer.gps.unixEpoch);
+  }
+#endif
 
   noInterrupts();
   if (wireBytes >= TELEMETRY_WIRE_LENGTH_MIN_FOR_LORA) {
@@ -339,26 +465,42 @@ void markTelemetryPacketReady(uint8_t wireBytes) {
   interrupts();
 
   validPacketCount++;
-  Serial.print("[I2C] Telemetry packet #");
-  Serial.print(validPacketCount);
-  Serial.print(" assembled, wireLength=");
-  Serial.print(wireBytes);
-  Serial.print(" bytes, GPS unix=");
+  Serial1.print("[I2C] Telemetry packet #");
+  Serial1.print(validPacketCount);
+  Serial1.print(" assembled, wireLength=");
+  Serial1.print(wireBytes);
+  Serial1.print(" bytes, GPS unix=");
   if (wireBytes >= offsetof(TelemetryData, bmp)) {
-    Serial.print(i2cTelemetryBuffer.gps.unixEpoch);
+    constexpr size_t kUnixOff =
+        offsetof(TelemetryData, gps) + offsetof(GPSData, unixEpoch);
+    uint32_t rawUnix = 0;
+    memcpy(&rawUnix, wire + kUnixOff, sizeof(uint32_t));
+    Serial1.print(rawUnix);
+    if (!unixOk) {
+      Serial1.print(" (not valid for PPS:");
+      if ((wire[3] & VALIDITY_GPS_UNIX_EPOCH) == 0) {
+        Serial1.print(" validity=0x");
+        Serial1.print(wire[3], HEX);
+        Serial1.print(" lacks VALIDITY_GPS_UNIX_EPOCH");
+      }
+      if (rawUnix < kGpsUnixMinPlausible || rawUnix > kGpsUnixMaxPlausible) {
+        Serial1.print(" unix out of range");
+      }
+      Serial1.print(')');
+    }
   } else {
-    Serial.print("(n/a)");
+    Serial1.print("(n/a)");
   }
-  Serial.print(", LoRa packet_ready=");
-  Serial.println(wireBytes >= TELEMETRY_WIRE_LENGTH_MIN_FOR_LORA ? "yes" : "no (short packet)");
+  Serial1.print(", LoRa packet_ready=");
+  Serial1.println(wireBytes >= TELEMETRY_WIRE_LENGTH_MIN_FOR_LORA ? "yes" : "no (short packet)");
 
   ledPulseI2cTelemetryComplete();
 }
 
 void processI2CFrame(const I2CFrame &frame) {
   if (frame.length < I2C_FRAME_HEADER_SIZE) {
-    Serial.print("Discarded invalid I2C frame shorter than header: ");
-    Serial.println(frame.length);
+    Serial1.print("Discarded invalid I2C frame shorter than header: ");
+    Serial1.println(frame.length);
     discardPartialPacket("short I2C frame");
     return;
   }
@@ -377,11 +519,11 @@ void processI2CFrame(const I2CFrame &frame) {
   uint8_t calculatedChecksum = checksumI2CPayload(payload, payloadSize);
   if (calculatedChecksum != receivedChecksum) {
     checksumFailureCount++;
-    Serial.print("Checksum failure on I2C frame (received 0x");
-    Serial.print(receivedChecksum, HEX);
-    Serial.print(", calculated 0x");
-    Serial.print(calculatedChecksum, HEX);
-    Serial.println(")");
+    Serial1.print("Checksum failure on I2C frame (received 0x");
+    Serial1.print(receivedChecksum, HEX);
+    Serial1.print(", calculated 0x");
+    Serial1.print(calculatedChecksum, HEX);
+    Serial1.println(")");
     discardPartialPacket("I2C frame checksum failure");
     return;
   }
@@ -392,10 +534,10 @@ void processI2CFrame(const I2CFrame &frame) {
     expectedTelemetryBytes = 0;
     receivingPacket = true;
     lastPacketFrameMillis = millis();
-    Serial.print("[I2C] START frame, flags=0x");
-    Serial.println(frameFlags, HEX);
+    Serial1.print("[I2C] START frame, flags=0x");
+    Serial1.println(frameFlags, HEX);
   } else if (!receivingPacket) {
-    Serial.println("Discarded continuation I2C frame with no active telemetry packet");
+    Serial1.println("Discarded continuation I2C frame with no active telemetry packet");
     return;
   }
 
@@ -418,15 +560,15 @@ void processI2CFrame(const I2CFrame &frame) {
     uint32_t now = millis();
     if (now - lastChunkLogMs >= 200) {
       lastChunkLogMs = now;
-      Serial.print("[I2C] chunk payload=");
-      Serial.print(payloadSize);
-      Serial.print(" B, assembled=");
-      Serial.print(i2cTelemetryBytesReceived);
-      Serial.print("/");
+      Serial1.print("[I2C] chunk payload=");
+      Serial1.print(payloadSize);
+      Serial1.print(" B, assembled=");
+      Serial1.print(i2cTelemetryBytesReceived);
+      Serial1.print("/");
       if (expectedTelemetryBytes > 0) {
-        Serial.println(expectedTelemetryBytes);
+        Serial1.println(expectedTelemetryBytes);
       } else {
-        Serial.println("?");
+        Serial1.println("?");
       }
     }
   }
@@ -438,8 +580,8 @@ void processI2CFrame(const I2CFrame &frame) {
       discardPartialPacket("invalid wireLength in telemetry header");
       return;
     }
-    Serial.print("[I2C] wireLength (from header) = ");
-    Serial.println(expectedTelemetryBytes);
+    Serial1.print("[I2C] wireLength (from header) = ");
+    Serial1.println(expectedTelemetryBytes);
   }
 
   if (expectedTelemetryBytes > 0 &&
@@ -474,8 +616,8 @@ bool popQueuedFrame(I2CFrame &frame) {
 // ========== RECEIVE I2C FRAME ISR ==========
 void receiveI2C(int count) {
   if (count > I2C_FRAME_MAX_SIZE) {
-    while (Wire.available()) {
-      Wire.read();
+    while (Wire1.available()) {
+      Wire1.read();
     }
     droppedFrameCount++;
     return;
@@ -483,8 +625,8 @@ void receiveI2C(int count) {
 
   uint8_t nextHead = (frameQueueHead + 1) % FRAME_QUEUE_SIZE;
   if (nextHead == frameQueueTail) {
-    while (Wire.available()) {
-      Wire.read();
+    while (Wire1.available()) {
+      Wire1.read();
     }
     droppedFrameCount++;
     return;
@@ -493,8 +635,8 @@ void receiveI2C(int count) {
   I2CFrame &frame = frameQueue[frameQueueHead];
   frame.length = 0;
   bool acceptFrame = false;
-  while (Wire.available()) {
-    uint8_t byteValue = Wire.read();
+  while (Wire1.available()) {
+    uint8_t byteValue = Wire1.read();
     if (frame.length < I2C_FRAME_MAX_SIZE) {
       frame.bytes[frame.length++] = byteValue;
       if (frame.length == 1) {
@@ -516,6 +658,20 @@ void receiveI2C(int count) {
   }
 
   frameQueueHead = nextHead;
+
+#if JACOB_I2C_TELEMETRY_VERBOSE
+  {
+    uint8_t depth =
+        (FRAME_QUEUE_SIZE + frameQueueHead - frameQueueTail) % FRAME_QUEUE_SIZE;
+    if (depth >= FRAME_QUEUE_SIZE - 4) {
+      Serial1.print("[I2C dbg] frame queue depth=");
+      Serial1.print(depth);
+      Serial1.print("/");
+      Serial1.print(FRAME_QUEUE_SIZE - 1);
+      Serial1.println(" (near full — risk of drops / split packets)");
+    }
+  }
+#endif
 }
 
 void processQueuedI2CFrames() {
@@ -528,9 +684,9 @@ void processQueuedI2CFrames() {
   if (currentDroppedFrameCount != lastDroppedFrameCount) {
     uint16_t droppedSinceLastLog = currentDroppedFrameCount - lastDroppedFrameCount;
     lastDroppedFrameCount = currentDroppedFrameCount;
-    Serial.print("WARNING: I2C frame queue overflow dropped ");
-    Serial.print(droppedSinceLastLog);
-    Serial.println(" frame(s)");
+    Serial1.print("WARNING: I2C frame queue overflow dropped ");
+    Serial1.print(droppedSinceLastLog);
+    Serial1.println(" frame(s)");
     discardPartialPacket("I2C frame queue overflow");
   }
 
@@ -548,21 +704,21 @@ void processQueuedI2CFrames() {
 // ========== LORA SEND ==========
 bool sendLoRa(uint8_t *data, uint8_t len) {
   if (!loraReady) {
-    Serial.println("[LoRa] TX skipped (radio not initialized)");
+    Serial1.println("[LoRa] TX skipped (radio not initialized)");
     return false;
   }
 
-  Serial.print("[LoRa] rf95.send(), len=");
-  Serial.print(len);
-  Serial.println(" ...");
+  Serial1.print("[LoRa] rf95.send(), len=");
+  Serial1.print(len);
+  Serial1.println(" ...");
 
   if (!rf95.send(data, len)) {
-    Serial.println("[LoRa] rf95.send() returned false");
+    Serial1.println("[LoRa] rf95.send() returned false");
     return false;
   }
 
   rf95.waitPacketSent();
-  Serial.println("[LoRa] waitPacketSent() done (on air)");
+  Serial1.println("[LoRa] waitPacketSent() done (on air)");
   return true;
 }
 
@@ -579,13 +735,13 @@ void processScheduledTransmission() {
     if (txWindowOpen && txWindowSendArmed && !packet_ready &&
         now - lastWaitingLogMs >= 3000) {
       lastWaitingLogMs = now;
-      Serial.println("[LoRa] TX window open, armed, but packet_ready=false (need I2C telemetry)");
+      Serial1.println("[LoRa] TX window open, armed, but packet_ready=false (need I2C telemetry)");
     }
     return;
   }
 
   if (!logged_this_tx_window) {
-    Serial.println("[LoRa] TX window: copying snapshot and transmitting...");
+    Serial1.println("[LoRa] TX window: copying snapshot and transmitting...");
     logged_this_tx_window = true;
   }
 
@@ -600,7 +756,7 @@ void processScheduledTransmission() {
   interrupts();
 
   if (sendLoRa(reinterpret_cast<uint8_t *>(&tx_copy), sizeof(tx_copy))) {
-    Serial.println("[LoRa] TX completed successfully");
+    Serial1.println("[LoRa] TX completed successfully");
     ledPulseLoRaTransmit();
     logged_this_tx_window = false;
     noInterrupts();
@@ -608,19 +764,16 @@ void processScheduledTransmission() {
     txWindowSendArmed = false;
     interrupts();
   } else {
-    Serial.println("[LoRa] TX failed (will retry while window allows)");
+    Serial1.println("[LoRa] TX failed (will retry while window allows)");
   }
 }
 
 // ========== SETUP ==========
 void setup() {
-  Serial.begin(115200);
+  Serial1.begin(115200);
   delay(1000);
 
   enableCycleCounter();
-
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
 
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), pps_isr, RISING);
@@ -636,28 +789,49 @@ void setup() {
   SPI.begin();
 
   if (!rf95.init()) {
-    Serial.println("LoRa radio init failed");
+    Serial1.println("LoRa radio init failed");
   } else if (!rf95.setFrequency(RF95_FREQ)) {
-    Serial.println("LoRa frequency set failed");
+    Serial1.println("LoRa frequency set failed");
   } else {
     rf95.setTxPower(23, false);
     loraReady = true;
-    Serial.println("LoRa radio initialized");
+    Serial1.println("LoRa radio initialized");
   }
 
-  Wire.begin(I2C_RECEIVE_ADDRESS);
-  Wire.onReceive(receiveI2C);
+  Wire1.begin(I2C_RECEIVE_ADDRESS);
+  Wire1.onReceive(receiveI2C);
   memcpy((void *)lora_tx_buffer.callsign, CALLSIGN, LORA_CALLSIGN_SIZE);
   lora_tx_buffer.stage_id[0] = (uint8_t)SLOT_TYPE;
 
-  Serial.println("System Initialized");
-  Serial.println("LED: double short flash = I2C telemetry packet complete; long flash = LoRa TX done");
+#if JACOB_I2C_TELEMETRY_VERBOSE
+  Serial1.println("[I2C dbg] Telemetry wire layout (must match Spencer/SD):");
+  Serial1.print("[I2C dbg] sizeof(TelemetryData)=");
+  Serial1.print(sizeof(TelemetryData));
+  Serial1.print(" TELEMETRY_PACKET_MAX_BYTES=");
+  Serial1.print(TELEMETRY_PACKET_MAX_BYTES);
+  Serial1.print(" offsetof(gps.unix)=");
+  Serial1.print(
+      (unsigned)(offsetof(TelemetryData, gps) + offsetof(GPSData, unixEpoch)));
+  Serial1.print(" offsetof(bmp)=");
+  Serial1.println((unsigned)offsetof(TelemetryData, bmp));
+#endif
+
+  Serial1.println("System Initialized");
+  Serial1.println("LED: double short flash = I2C telemetry packet complete; long flash = LoRa TX done");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
 }
 
 // ========== LOOP ==========
 void loop() {
   getCycles64();     // maintain counter
-  processQueuedI2CFrames();
+  // Multiple passes drain frames that arrived while processing (verbose Serial
+  // used to slow this enough by accident); keep PPS/unix scheduling correct with
+  // verbose off.
+  for (uint8_t drainPass = 0; drainPass < 6; drainPass++) {
+    processQueuedI2CFrames();
+  }
 
   if (pps_flag) {
     noInterrupts();
@@ -675,21 +849,21 @@ void loop() {
   // if (millis() - lastPrint > 500) {
   //   lastPrint = millis();
 
-  //   Serial.print("UTC: ");
-  //   Serial.print(utc_seconds);
-  //   Serial.print(" | Cycle ms: ");
-  //   Serial.print(getCycleTimeMs());
-  //   Serial.print(" | Window(ms): ");
-  //   Serial.print(TX_READY_WINDOW_MS);
-  //   Serial.print(" | Ready: ");
-  //   Serial.print(packet_ready ? "yes" : "no");
-  //   Serial.print(" | Valid: ");
-  //   Serial.print(validPacketCount);
-  //   Serial.print(" | Invalid: ");
-  //   Serial.print(invalidPacketCount);
-  //   Serial.print(" | Ignored: ");
-  //   Serial.print(ignoredFrameCount);
-  //   Serial.print(" | Checksum failures: ");
-  //   Serial.println(checksumFailureCount);
+  //   Serial1.print("UTC: ");
+  //   Serial1.print(utc_seconds);
+  //   Serial1.print(" | Cycle ms: ");
+  //   Serial1.print(getCycleTimeMs());
+  //   Serial1.print(" | Window(ms): ");
+  //   Serial1.print(TX_READY_WINDOW_MS);
+  //   Serial1.print(" | Ready: ");
+  //   Serial1.print(packet_ready ? "yes" : "no");
+  //   Serial1.print(" | Valid: ");
+  //   Serial1.print(validPacketCount);
+  //   Serial1.print(" | Invalid: ");
+  //   Serial1.print(invalidPacketCount);
+  //   Serial1.print(" | Ignored: ");
+  //   Serial1.print(ignoredFrameCount);
+  //   Serial1.print(" | Checksum failures: ");
+  //   Serial1.println(checksumFailureCount);
   // }
 }

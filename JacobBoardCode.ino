@@ -104,7 +104,8 @@ const uint8_t I2C_FRAME_START = 1 << 7;
 // faster than loop() drains. Undersized queue drops middle frames and START
 // resets reassembly — unixEpoch straddles chunk 1/2 so it often reads as 0.
 const uint8_t FRAME_QUEUE_SIZE = 32;
-const uint8_t TELEMETRY_RING_SIZE = 5;
+/** Single slot: only the latest complete telemetry is retained for LoRa. */
+const uint8_t TELEMETRY_RING_SIZE = 1;
 const unsigned long PACKET_RECEIVE_TIMEOUT_MS = 1000;
 
 struct I2CFrame {
@@ -142,10 +143,9 @@ volatile bool packet_ready = false;
 
 uint8_t expectedTelemetryBytes = 0;
 
-// Last TELEMETRY_RING_SIZE complete I2C packets (same broadcast as SD logger).
-// Newest index updated on each full reassembly; LoRa TX copies from it at send.
+// Latest complete I2C telemetry only (older packets discarded on each commit).
+// LoRa TX copies from telemetryRing[telemetryRingNewestIdx] at send.
 TelemetryData telemetryRing[TELEMETRY_RING_SIZE];
-uint8_t telemetryRingWriteNext = 0;
 uint8_t telemetryRingNewestIdx = 0;
 
 uint32_t validPacketCount = 0;
@@ -448,11 +448,9 @@ void discardPartialPacket(const char *reason) {
 }
 
 void markTelemetryPacketReady(uint8_t wireBytes) {
-  memset(&telemetryRing[telemetryRingWriteNext], 0, sizeof(TelemetryData));
-  memcpy(&telemetryRing[telemetryRingWriteNext], &i2cTelemetryBuffer, wireBytes);
-  telemetryRingNewestIdx = telemetryRingWriteNext;
-  telemetryRingWriteNext =
-      (telemetryRingWriteNext + 1) % TELEMETRY_RING_SIZE;
+  memset(&telemetryRing[0], 0, sizeof(TelemetryData));
+  memcpy(&telemetryRing[0], &i2cTelemetryBuffer, wireBytes);
+  telemetryRingNewestIdx = 0;
 
   const uint8_t *wire = i2cTelemetryBytes();
   uint32_t validatedUnix = 0;
@@ -627,6 +625,54 @@ bool popQueuedFrame(I2CFrame &frame) {
   return true;
 }
 
+/**
+ * Latest-wins (LIFO policy on the backlog): drop queued frames older than the
+ * newest START frame so we reassemble only the current Spencer burst, not stale
+ * chunks that would otherwise be processed first-in-first-out.
+ */
+static void skipQueuedI2cToLatestStart() {
+  noInterrupts();
+  const uint8_t tail = frameQueueTail;
+  const uint8_t head = frameQueueHead;
+  if (tail == head) {
+    interrupts();
+    return;
+  }
+
+  const uint8_t depth =
+      (uint8_t)((head + FRAME_QUEUE_SIZE - tail) % FRAME_QUEUE_SIZE);
+  int16_t foundIdx = -1;
+  for (uint8_t k = 0; k < depth; k++) {
+    const uint8_t idx =
+        (uint8_t)((tail + depth - 1 - k + FRAME_QUEUE_SIZE) % FRAME_QUEUE_SIZE);
+    const I2CFrame &f = frameQueue[idx];
+    if (f.length < I2C_FRAME_HEADER_SIZE) {
+      continue;
+    }
+    if ((f.bytes[0] & I2C_FRAME_START) != 0) {
+      foundIdx = idx;
+      break;
+    }
+  }
+
+  if (foundIdx < 0) {
+    frameQueueTail = frameQueueHead;
+    interrupts();
+    discardPartialPacket(
+        "queued I2C had no START frame; dropped all (latest-wins)");
+    return;
+  }
+
+  if ((uint8_t)foundIdx != tail) {
+    frameQueueTail = (uint8_t)foundIdx;
+    interrupts();
+    discardPartialPacket(
+        "skipped older queued I2C in favor of latest START (latest-wins)");
+  } else {
+    interrupts();
+  }
+}
+
 // ========== RECEIVE I2C FRAME ISR ==========
 void receiveI2C(int count) {
   if (count > I2C_FRAME_MAX_SIZE) {
@@ -703,6 +749,8 @@ void processQueuedI2CFrames() {
     Serial1.println(" frame(s)");
     discardPartialPacket("I2C frame queue overflow");
   }
+
+  skipQueuedI2cToLatestStart();
 
   I2CFrame frame;
   while (popQueuedFrame(frame)) {
